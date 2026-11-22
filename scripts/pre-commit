@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Mandate pre-commit hook: block commits that would leak secrets.
+# Install:  cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Plain bash + git + grep; no installs needed (works in Git for Windows bash).
+#
+# Blocks when:
+#   1. a .env file (not .env.example) is staged
+#   2. an added line contains an Anthropic key prefix
+#   3. an added line contains a Telegram bot token (digits:35 chars)
+#   4. an added line sets *KEY=, *TOKEN= or *SECRET= to a real-looking value
+#      (16+ token characters, not an obvious placeholder)
+# Matched values are never printed - only file names and the rule that fired.
+
+set -u
+fail=0
+
+# --- 1. staged .env files -------------------------------------------------
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base="${f##*/}"
+  case "$base" in
+    .env.example|.env.sample|.env.template) ;;
+    .env|.env.*)
+      echo "pre-commit: BLOCKED - '$f' is an env file and must never be committed." >&2
+      fail=1 ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+# --- 2-4. scan added lines ------------------------------------------------
+# One awk pass over the staged diff (spawning grep per line is very slow on Windows).
+# Patterns are written so they do not match this file's own text; passed via ENVIRON
+# so awk does not reinterpret backslashes.
+export ANTHROPIC_RE='sk-an[t]-'
+export TELEGRAM_RE='[0-9]{8,10}:[A-Za-z0-9_-]{35}'
+export ASSIGN_RE='[A-Z0-9_]*(KEY|TOKEN|SECRET)[A-Z0-9_]*[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9_+/.=:-]{16,}'
+export PLACEHOLDER_RE='(your|example|changeme|change-me|placeholder|dummy|fake|not-real|xxxx|<|[$][{]|[.][.][.])'
+
+findings=$(git diff --cached -U0 --no-color --diff-filter=ACMR | awk '
+  { sub(/\r$/, "") }
+  /^\+\+\+ b\// { file = substr($0, 7); next }
+  /^\+\+\+ /    { file = ""; next }
+  /^\+/ && file != "" {
+    line = substr($0, 2)
+    if (line ~ ENVIRON["ANTHROPIC_RE"]) hit[file ": Anthropic-style API key"] = 1
+    if (line ~ ENVIRON["TELEGRAM_RE"])  hit[file ": Telegram bot token"] = 1
+    if (match(line, ENVIRON["ASSIGN_RE"])) {
+      m = tolower(substr(line, RSTART, RLENGTH))
+      if (m !~ ENVIRON["PLACEHOLDER_RE"]) hit[file ": real-looking KEY/TOKEN/SECRET value"] = 1
+    }
+  }
+  END { for (h in hit) print h }
+')
+if [ -n "$findings" ]; then
+  while IFS= read -r f; do echo "pre-commit: BLOCKED - $f" >&2; done <<< "$findings"
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "pre-commit: commit aborted. Move secrets to .env (git-ignored) and use placeholders." >&2
+  exit 1
+fi
+exit 0

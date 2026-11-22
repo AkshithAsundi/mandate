@@ -1,0 +1,9 @@
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4
+python-dotenv==1.2.4
+cryptography==50.0.2
+httpx==0.28.1
+pytest==9.2.0
+# Official MCP Python SDK. In 2.x, FastMCP is named MCPServer (mcp.server.mcpserver).
+mcp==2.3.0
