@@ -32,6 +32,34 @@ CREATE TABLE IF NOT EXISTS approvals (
     created_at  TEXT NOT NULL,
     decided_at  TEXT
 );
+CREATE TABLE IF NOT EXISTS payment_tokens (
+    jti         TEXT PRIMARY KEY,
+    token       TEXT NOT NULL,
+    mandate_id  TEXT NOT NULL,
+    action_id   TEXT NOT NULL,
+    merchant    TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    currency    TEXT NOT NULL,
+    issued_at   TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    used_at     TEXT,               -- set once, atomically, when paid
+    payment_id  TEXT
+);
+CREATE TABLE IF NOT EXISTS wallet (
+    id        TEXT PRIMARY KEY,     -- single mock wallet: 'default'
+    currency  TEXT NOT NULL,
+    balance   REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id          TEXT PRIMARY KEY,
+    jti         TEXT NOT NULL UNIQUE,
+    mandate_id  TEXT NOT NULL,
+    action_id   TEXT NOT NULL,
+    merchant    TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    currency    TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_log (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         TEXT NOT NULL,

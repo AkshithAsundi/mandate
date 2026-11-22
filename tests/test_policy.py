@@ -1,8 +1,8 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-import app.main as main
-from app import config, crypto
+
+from app import clock, config, crypto
 from tests.conftest import TEST_SECRET
 
 
@@ -53,7 +53,7 @@ def test_pending_approval_reserves_weekly_budget(make_mandate, act):
 
 def test_expired_mandate_is_denied(make_mandate, act, monkeypatch):
     m = make_mandate(expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
-    monkeypatch.setattr(main, "_now", lambda: datetime.now(timezone.utc) + timedelta(hours=1))
+    monkeypatch.setattr(clock, "now", lambda: datetime.now(timezone.utc) + timedelta(hours=1))
     r = act(m["id"], 100)
     assert r["decision"] == "deny"
     assert "expired" in r["reason"]

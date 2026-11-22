@@ -46,6 +46,9 @@ class ActionResponse(BaseModel):
     decision: Literal["allow", "deny", "pending_approval"]
     reason: str
     approval_id: str | None = None
+    # Present only when decision == "allow": one-time token for POST /wallet/pay.
+    payment_token: str | None = None
+    payment_token_expires_at: str | None = None
 
 
 class ApprovalDecision(BaseModel):
@@ -63,3 +66,9 @@ class Approval(BaseModel):
     amount: float
     created_at: str
     decided_at: str | None = None
+    # Present only when status == "approved" (and only to the polling agent, not the n8n callback).
+    payment_token: str | None = None
+    payment_token_expires_at: str | None = None
+    payment_token_used: bool | None = None
+    # Set by the long-poll endpoint when it returned because the timeout elapsed.
+    timed_out: bool = False

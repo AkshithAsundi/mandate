@@ -1,17 +1,18 @@
-"""Mandate policy server (M1).
+"""Mandate policy server.
 
-Run:  .venv/Scripts/python -m uvicorn app.main:app --reload
+Run:  .venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Docs: http://127.0.0.1:8000/docs
 """
+import asyncio
 import hmac
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 
-from . import approvals, audit, config, crypto, db
+from . import approvals, audit, clock, config, crypto, db, tokens, wallet
 from .models import (ActionRequest, ActionResponse, Approval, ApprovalDecision, Mandate,
                      MandateCreate)
 from .policy import evaluate, parse_ts
@@ -19,18 +20,18 @@ from .policy import evaluate, parse_ts
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("mandate")
 
-app = FastAPI(title="Mandate", version="0.1.0",
-              description="Signed, revocable mandates for AI agents. Payments are simulated.")
+app = FastAPI(title="Mandate", version="0.2.0",
+              description="Signed, revocable mandates for AI agents. Payments are simulated (mock wallet).")
+app.include_router(wallet.router)
+
+MAX_WAIT_SECONDS = 300
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return clock.now()
 
 
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+_iso = clock.iso
 
 
 # ---------------------------------------------------------------- helpers --
@@ -66,7 +67,7 @@ def _committed_this_week(conn, mandate_id: str, now: datetime) -> float:
     return float(row["total"])
 
 
-def _approval_out(conn, approval_id: str) -> Approval | None:
+def _approval_out(conn, approval_id: str, include_token: bool = True) -> Approval | None:
     row = conn.execute(
         """SELECT p.*, a.action_type, a.merchant, a.amount
            FROM approvals p JOIN actions a ON a.id = p.action_id WHERE p.id = ?""",
@@ -74,10 +75,27 @@ def _approval_out(conn, approval_id: str) -> Approval | None:
     ).fetchone()
     if not row:
         return None
-    return Approval(approval_id=row["id"], action_id=row["action_id"], mandate_id=row["mandate_id"],
-                    status=row["status"], reason=row["reason"], action_type=row["action_type"],
-                    merchant=row["merchant"], amount=row["amount"], created_at=row["created_at"],
-                    decided_at=row["decided_at"])
+    out = Approval(approval_id=row["id"], action_id=row["action_id"], mandate_id=row["mandate_id"],
+                   status=row["status"], reason=row["reason"], action_type=row["action_type"],
+                   merchant=row["merchant"], amount=row["amount"], created_at=row["created_at"],
+                   decided_at=row["decided_at"])
+    if include_token and out.status == "approved":
+        tok = tokens.for_action(conn, out.action_id)
+        if tok:
+            out.payment_token = tok["token"]
+            out.payment_token_expires_at = tok["expires_at"]
+            out.payment_token_used = tok["used_at"] is not None
+    return out
+
+
+def _pending_reason(policy_reason: str, approval_id: str) -> str:
+    if config.n8n_webhook_url():
+        how = "The owner has been notified and must approve or deny it."
+    else:
+        how = ("No notification channel is configured, so the owner must approve or deny it "
+               "directly on the Mandate server.")
+    return (f"{policy_reason}. Approval request {approval_id} created. {how} "
+            f"Wait for the decision on approval_id {approval_id}; do not proceed before it is approved.")
 
 
 # ----------------------------------------------------------------- routes --
@@ -89,7 +107,7 @@ def health():
 
 @app.get("/public_key")
 def public_key():
-    """Ed25519 public key (base64, raw 32 bytes) for verifying mandate signatures."""
+    """Ed25519 public key (base64, raw 32 bytes) for verifying mandate signatures and payment tokens."""
     return {"alg": "Ed25519", "public_key": crypto.public_key_b64()}
 
 
@@ -150,6 +168,7 @@ def revoke_mandate(mandate_id: str):
                 now = _iso(_now())
                 conn.execute("UPDATE mandates SET revoked = 1, revoked_at = ? WHERE id = ?", (now, mandate_id))
                 # Any approval still waiting on the owner dies with the mandate.
+                # Unused payment tokens become worthless: the wallet re-checks revocation at pay time.
                 conn.execute(
                     "UPDATE approvals SET status='denied', reason='mandate revoked', decided_at=? "
                     "WHERE mandate_id=? AND status='pending'", (now, mandate_id))
@@ -166,6 +185,7 @@ def request_action(req: ActionRequest, background: BackgroundTasks):
     now = _now()
     action_id = "act_" + uuid.uuid4().hex[:16]
     approval_id = None
+    token = None
     conn = db.connect()
     try:
         with db.write_lock:  # spend check + insert must be atomic
@@ -178,14 +198,21 @@ def request_action(req: ActionRequest, background: BackgroundTasks):
             spent = _committed_this_week(conn, req.mandate_id, now)
             d = evaluate(mandate, req.action_type, req.merchant, req.amount, spent, now,
                          signature_valid=mandate["signature_valid"])
+            reason = d.reason
+            if d.decision == "pending_approval":
+                approval_id = "apr_" + uuid.uuid4().hex[:16]
+                reason = _pending_reason(d.reason, approval_id)
             conn.execute(
                 "INSERT INTO actions (id, mandate_id, action_type, merchant, amount, decision, reason, created_at) "
                 "VALUES (?,?,?,?,?,?,?,?)",
-                (action_id, req.mandate_id, req.action_type, req.merchant, req.amount, d.decision, d.reason, _iso(now)))
+                (action_id, req.mandate_id, req.action_type, req.merchant, req.amount, d.decision, reason, _iso(now)))
             audit.append("action.requested", {"action_id": action_id, **req.model_dump(),
-                                              "decision": d.decision, "reason": d.reason}, conn)
-            if d.decision == "pending_approval":
-                approval_id = "apr_" + uuid.uuid4().hex[:16]
+                                              "decision": d.decision, "reason": reason}, conn)
+            if d.decision == "allow":
+                token = tokens.issue(conn, mandate_id=req.mandate_id, action_id=action_id,
+                                     merchant=req.merchant, amount=req.amount, currency=mandate["currency"])
+                audit.append("token.issued", {"jti": token["jti"], "action_id": action_id}, conn)
+            elif approval_id:
                 conn.execute(
                     "INSERT INTO approvals (id, action_id, mandate_id, status, created_at) VALUES (?,?,?,?,?)",
                     (approval_id, action_id, req.mandate_id, "pending", _iso(now)))
@@ -196,18 +223,22 @@ def request_action(req: ActionRequest, background: BackgroundTasks):
         conn.close()
 
     if approval:
-        approval["agent_id"] = mandate["agent_id"]
-        approval["owner"] = mandate["owner"]
-        approval["currency"] = mandate["currency"]
+        approval.update(agent_id=mandate["agent_id"], owner=mandate["owner"], currency=mandate["currency"],
+                        policy_reason=d.reason)
+        for k in ("payment_token", "payment_token_expires_at", "payment_token_used", "timed_out"):
+            approval.pop(k, None)
         background.add_task(approvals.notify, approval)
 
-    return ActionResponse(action_id=action_id, decision=d.decision, reason=d.reason, approval_id=approval_id)
+    return ActionResponse(action_id=action_id, decision=d.decision, reason=reason, approval_id=approval_id,
+                          payment_token=token["token"] if token else None,
+                          payment_token_expires_at=token["expires_at"] if token else None)
 
 
-@app.post("/approvals/{approval_id}", response_model=Approval)
+@app.post("/approvals/{approval_id}", response_model=Approval, response_model_exclude_none=True)
 def decide_approval(approval_id: str, body: ApprovalDecision,
                     x_approval_secret: str | None = Header(default=None)):
-    """Callback for n8n. Requires header X-Approval-Secret == APPROVAL_SECRET."""
+    """Callback for n8n / the owner. Requires header X-Approval-Secret == APPROVAL_SECRET.
+    The response never contains the payment token - only the agent's poll does."""
     expected = config.approval_secret()
     if not expected:
         raise HTTPException(503, "APPROVAL_SECRET is not configured on the server")
@@ -218,7 +249,7 @@ def decide_approval(approval_id: str, body: ApprovalDecision,
     conn = db.connect()
     try:
         with db.write_lock:
-            current = _approval_out(conn, approval_id)
+            current = _approval_out(conn, approval_id, include_token=False)
             if not current:
                 raise HTTPException(404, "approval not found")
             if current.status != "pending":
@@ -226,9 +257,9 @@ def decide_approval(approval_id: str, body: ApprovalDecision,
             now = _now()
             status, reason = ("approved", "approved by owner") if body.decision == "approve" \
                 else ("denied", "denied by owner")
+            mandate = _load_mandate(conn, current.mandate_id)
             if status == "approved":
                 # Re-check the mandate: it may have expired or been revoked while waiting.
-                mandate = _load_mandate(conn, current.mandate_id)
                 if mandate["revoked"]:
                     status, reason = "denied", "mandate revoked before approval"
                 elif now >= parse_ts(mandate["expires_at"]):
@@ -237,8 +268,12 @@ def decide_approval(approval_id: str, body: ApprovalDecision,
                          (status, reason, _iso(now), approval_id))
             audit.append("approval.decided", {"approval_id": approval_id, "decision": body.decision,
                                               "status": status, "reason": reason}, conn)
+            if status == "approved":
+                tok = tokens.issue(conn, mandate_id=current.mandate_id, action_id=current.action_id,
+                                   merchant=current.merchant, amount=current.amount, currency=mandate["currency"])
+                audit.append("token.issued", {"jti": tok["jti"], "action_id": current.action_id}, conn)
             conn.commit()
-            result = _approval_out(conn, approval_id)
+            result = _approval_out(conn, approval_id, include_token=False)
     finally:
         conn.close()
     return result
@@ -254,6 +289,23 @@ def get_approval(approval_id: str):
     if not result:
         raise HTTPException(404, "approval not found")
     return result
+
+
+@app.get("/approvals/{approval_id}/wait", response_model=Approval)
+async def wait_for_approval(approval_id: str, timeout: float = 120):
+    """Long-poll: returns as soon as the approval is decided, or after `timeout` seconds
+    (max 300) with status 'pending' and timed_out=true."""
+    timeout = min(max(timeout, 0.0), MAX_WAIT_SECONDS)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        result = get_approval(approval_id)  # raises 404 if unknown
+        if result.status != "pending":
+            return result
+        if loop.time() >= deadline:
+            result.timed_out = True
+            return result
+        await asyncio.sleep(0.5)
 
 
 @app.get("/audit/verify")

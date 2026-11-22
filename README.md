@@ -5,9 +5,38 @@ spend, until when — blocks anything outside it, and asks you on your phone for
 
 Built for Homingo Hack Days 2026, track A1 "Software built for agents".
 The agent is Claude Code or Claude Desktop, connected to Mandate as an MCP server. No model API keys are used.
-**Payments are simulated:** Mandate decides whether an action may happen. No real money moves.
+**Payments are simulated:** a mock wallet with a mock balance. No real money moves.
 
-## What works now (Milestone M1)
+## Core security property: the agent can only pay with a one-time token
+
+The agent has **no** way to move money except the `pay(token, merchant, amount)` tool, and the
+mock wallet behind it accepts nothing but a **one-time authorization token issued by Mandate**:
+
+- A token is issued only when `request_action` returns `allow`, or when the owner approves a
+  pending action. Denied actions get no token.
+- It is **Ed25519-signed** by the server and **bound** to one mandate, one action, one exact merchant and
+  one exact amount, and it **expires after 10 minutes**.
+- The wallet checks the signature, that this server issued the token, expiry, exact merchant/amount,
+  **single use** (enforced atomically), that the mandate is still valid (not revoked, expired or
+  altered), and the balance. Any failure is refused with a clear reason and written to the audit log.
+
+So a misbehaving or prompt-injected agent can't pay more, pay someone else, replay an earlier
+payment, or keep spending after you revoke. Policy decisions are enforced at the point of payment
+and are more than advice.
+
+### Keep the agent away from the secrets
+
+The guarantee above only holds if the agent can't act as the owner. **The agent must never run with
+access to `.env` or `APPROVAL_SECRET`.** With that secret it could approve its own requests.
+
+- Run Claude Code / Claude Desktop **in a different folder** (not this repo), with **MCP-only access**
+  to Mandate. The user-scope MCP registration in [docs/claude_mcp_setup.md](docs/claude_mcp_setup.md)
+  makes the tools available from any folder.
+- The MCP server process reads only `MANDATE_BASE_URL` from `.env`. It never loads `APPROVAL_SECRET`,
+  and none of its tools can approve.
+- Only the owner side (n8n, or you by hand) holds `APPROVAL_SECRET`.
+
+## What works now (M1 + M2 part A)
 
 - **Mandates** carry: weekly spend limit, approval threshold, allowed merchants, allowed action
   types and expiry. Each is signed with the server's Ed25519 key, which is generated on first run
@@ -17,12 +46,20 @@ The agent is Claude Code or Claude Desktop, connected to Mandate as an MCP serve
   Rules, first match wins: bad signature → revoked → expired → action type → merchant → weekly limit
   (pending approvals reserve budget) → amount above threshold needs approval → allow.
 - **Human approval**: pending actions are POSTed to `N8N_WEBHOOK_URL`. If that is empty, the server
-  only logs what it would have sent. n8n calls back `POST /approvals/{id}` with the
-  `X-Approval-Secret` header. The agent polls `GET /approvals/{id}`.
-- **Revocation**: `POST /mandates/{id}/revoke`. Later actions are denied, and pending approvals are cancelled.
-- **Audit log**: every request and decision goes into a hash-chained log. `GET /audit/verify` detects
-  edited or deleted entries.
-- **MCP server** (`mcp_server/server.py`) exposes `request_action`, `check_approval` and `get_mandate`.
+  only logs what it would have sent, and the response says no notification channel is configured.
+  Pending responses always include the `approval_id`. n8n calls back `POST /approvals/{id}` with the
+  `X-Approval-Secret` header. The agent waits with `GET /approvals/{id}/wait?timeout=120`, a long-poll
+  that returns as soon as the owner decides (max 300 s). Once approved, the agent's poll includes the
+  payment token. The n8n callback response never does.
+- **Mock wallet**: `POST /wallet/pay {token, merchant, amount}` and `GET /wallet` (balance and
+  recent payments). The starting balance is `MOCK_WALLET_BALANCE` (default 50,000 INR).
+- **Revocation**: `POST /mandates/{id}/revoke`. Later actions are denied, pending approvals are
+  cancelled, and unused tokens can no longer pay.
+- **Audit log**: every request, decision, token issue and payment (paid or refused) goes into a
+  hash-chained log. `GET /audit/verify` detects edited or deleted entries.
+- **MCP server** (`mcp_server/server.py`) exposes `request_action`, `wait_for_approval`, `pay`,
+  `get_mandate` and `check_approval`. The tool descriptions walk the agent through
+  request → wait → pay.
 
 ## Run it (Windows)
 
@@ -69,13 +106,20 @@ curl -s -X POST http://127.0.0.1:8000/approvals/$APR -H "Content-Type: applicati
 curl -s -X POST http://127.0.0.1:8000/approvals/$APR -H "Content-Type: application/json" \
   -H "X-Approval-Secret: $(grep '^APPROVAL_SECRET=' .env | cut -d= -f2-)" -d '{"decision":"approve"}'; echo
 
-# 5. Poll as the agent would -> "status":"approved"
-curl -s http://127.0.0.1:8000/approvals/$APR; echo
+# 5. Wait as the agent would (long-poll) -> "status":"approved" plus a one-time payment_token
+TOK=$(curl -s "http://127.0.0.1:8000/approvals/$APR/wait?timeout=30" \
+  | .venv/Scripts/python -c "import sys,json;d=json.load(sys.stdin);print(d['status'],file=sys.stderr);print(d['payment_token'])")
 
-# 6. Verify the audit chain -> {"valid":true,...}
+# 6. Pay with the token -> "status":"paid". Wrong amount or a second use is refused.
+curl -s -X POST http://127.0.0.1:8000/wallet/pay -H "Content-Type: application/json" -d "{\"token\":\"$TOK\",\"merchant\":\"amazon.in\",\"amount\":9999}"; echo
+curl -s -X POST http://127.0.0.1:8000/wallet/pay -H "Content-Type: application/json" -d "{\"token\":\"$TOK\",\"merchant\":\"amazon.in\",\"amount\":1200}"; echo
+curl -s -X POST http://127.0.0.1:8000/wallet/pay -H "Content-Type: application/json" -d "{\"token\":\"$TOK\",\"merchant\":\"amazon.in\",\"amount\":1200}"; echo
+curl -s http://127.0.0.1:8000/wallet; echo
+
+# 7. Verify the audit chain -> {"valid":true,...}
 curl -s http://127.0.0.1:8000/audit/verify; echo
 
-# 7. Revoke -> the next action is denied
+# 8. Revoke -> the next action is denied
 curl -s -X POST http://127.0.0.1:8000/mandates/$MID/revoke > /dev/null
 curl -s -X POST http://127.0.0.1:8000/request_action -H "Content-Type: application/json" -d "{\"mandate_id\":\"$MID\",\"action_type\":\"purchase\",\"merchant\":\"swiggy\",\"amount\":10}"; echo
 ```
@@ -100,11 +144,12 @@ Then start it again and call `/audit/verify`. It returns `"valid":false` with `b
 ## Layout
 
 ```
-app/          FastAPI server: main.py, db.py, models.py, policy.py, crypto.py, audit.py, approvals.py, config.py
+app/          FastAPI server: main.py, db.py, models.py, policy.py, crypto.py, audit.py,
+              approvals.py, tokens.py (payment tokens), wallet.py (mock wallet), clock.py, config.py
 mcp_server/   server.py — MCP server (stdio) for Claude Code / Claude Desktop
 docs/         claude_mcp_setup.md
 scripts/      pre-commit
-tests/        pytest tests (policy rules, approvals, audit tampering)
+tests/        pytest tests (policy rules, approvals, audit tampering, wallet/token enforcement)
 ```
 
 ## AI tools, models and libraries used

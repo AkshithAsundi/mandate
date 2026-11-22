@@ -1,15 +1,21 @@
 # Connect Mandate to Claude Code / Claude Desktop (Windows)
 
 Mandate's MCP server (`mcp_server/server.py`) runs over **stdio**. Claude starts it with the
-project's venv Python. It exposes three tools that call the Mandate API:
+project's venv Python. It exposes five tools that call the Mandate API:
 
 | Tool | What it does |
 |---|---|
-| `request_action(mandate_id, action_type, merchant, amount)` | Returns `allow`, `deny` + reason, or `pending_approval` + `approval_id` |
-| `check_approval(approval_id)` | Returns `pending`, `approved` or `denied` |
+| `request_action(mandate_id, action_type, merchant, amount)` | Returns `allow` + one-time `payment_token`, `deny` + reason, or `pending_approval` + `approval_id` |
+| `wait_for_approval(approval_id, timeout_seconds=120)` | Long-polls until the owner decides. Once approved, it includes the `payment_token` |
+| `pay(payment_token, merchant, amount)` | Pays from the mock wallet (simulated). This is the only way to pay |
 | `get_mandate(mandate_id)` | Returns the mandate's limits, expiry, revoked flag and signature |
+| `check_approval(approval_id)` | Returns the current status without waiting |
 
 No model API key is needed. Claude Code or Claude Desktop is the agent.
+
+> **Security:** run the agent **outside this repo** (any other folder) so it can't read `.env` or
+> `APPROVAL_SECRET`. With that secret it could approve its own requests. Register the server at
+> **user scope** (below) so the tools work from any folder.
 
 Below, replace `C:\path\to\mandate` with the folder you cloned the repo into.
 
@@ -40,13 +46,25 @@ Note the returned `id` (`mdt_...`).
 
 ## 1. Claude Code
 
-Run this from the repo folder. It writes the server into Claude Code's config for this project:
+Register it at user scope so it works from any folder. Forward slashes work fine on Windows:
 
 ```powershell
-claude mcp add mandate -- C:\path\to\mandate\.venv\Scripts\python.exe C:\path\to\mandate\mcp_server\server.py
+claude mcp add --scope user mandate -- C:/path/to/mandate/.venv/Scripts/python.exe C:/path/to/mandate/mcp_server/server.py
 ```
 
-To make it available in every project, add `--scope user` after `add`.
+If the `claude` CLI isn't installed (for example, you only use the desktop app's Code tab), add the
+same entry by hand to `%USERPROFILE%\.claude.json` under the top-level `"mcpServers"` key:
+
+```json
+"mandate": {
+  "type": "stdio",
+  "command": "C:/path/to/mandate/.venv/Scripts/python.exe",
+  "args": ["C:/path/to/mandate/mcp_server/server.py"],
+  "env": {}
+}
+```
+
+Then start a Claude Code session **in a folder other than this repo**.
 
 Check it:
 
@@ -54,11 +72,14 @@ Check it:
 claude mcp list            # mandate should show as connected
 ```
 
-In a Claude Code session, `/mcp` also shows the server and its 3 tools.
+In a Claude Code session, `/mcp` also shows the server and its 5 tools.
 
-Try it with a prompt like: *"Using mandate mdt_XXXX, buy a ₹1,200 item from amazon.in. Check with
-Mandate first."* Claude calls `request_action` and gets `pending_approval`. Approve the request
-(see the README's manual flow), and Claude's next `check_approval` call returns `approved`.
+Try it with a prompt like: *"Using mandate mdt_XXXX, buy a ₹1,200 item from amazon.in."*
+1. Claude calls `request_action` and gets `pending_approval` with an `approval_id`.
+2. It then calls `wait_for_approval`, which blocks.
+3. Approve the request as the owner (see the README's manual flow). The wait returns `approved`
+   with a `payment_token`.
+4. Claude calls `pay` with that token.
 
 Remove it: `claude mcp remove mandate`.
 
@@ -92,4 +113,7 @@ Remove it: `claude mcp remove mandate`.
   by hand. It should wait silently for input (Ctrl+C to exit). An import error means the venv is
   missing packages; reinstall `requirements.txt`.
 - **Claude Desktop logs**: `%APPDATA%\Claude\logs\mcp-server-mandate.log`.
-- The MCP server never needs secrets. `APPROVAL_SECRET` is only used by the n8n → `/approvals` callback.
+- The MCP server never needs secrets. It reads only `MANDATE_BASE_URL` from `.env`.
+  `APPROVAL_SECRET` is only used by the owner side (n8n → `/approvals` callback).
+- `wait_for_approval` can block up to `timeout_seconds` (max 300). If your client times out tool
+  calls sooner, pass a smaller timeout and call it again.

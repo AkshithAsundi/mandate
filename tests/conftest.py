@@ -17,6 +17,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("MANDATE_KEY_PATH", str(tmp_path / "test_key.pem"))
     monkeypatch.setenv("APPROVAL_SECRET", TEST_SECRET)
     monkeypatch.setenv("N8N_WEBHOOK_URL", "")
+    monkeypatch.setenv("MOCK_WALLET_BALANCE", "10000")
     from app.main import app
     with TestClient(app) as c:
         yield c

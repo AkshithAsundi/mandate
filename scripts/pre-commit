@@ -8,7 +8,7 @@
 #   2. an added line contains an Anthropic key prefix
 #   3. an added line contains a Telegram bot token (digits:35 chars)
 #   4. an added line sets *KEY=, *TOKEN= or *SECRET= to a real-looking value
-#      (16+ token characters, not an obvious placeholder)
+#      (16+ token characters mixing letters and digits, not an obvious placeholder)
 # Matched values are never printed - only file names and the rule that fired.
 
 set -u
@@ -45,7 +45,10 @@ findings=$(git diff --cached -U0 --no-color --diff-filter=ACMR | awk '
     if (line ~ ENVIRON["TELEGRAM_RE"])  hit[file ": Telegram bot token"] = 1
     if (match(line, ENVIRON["ASSIGN_RE"])) {
       m = tolower(substr(line, RSTART, RLENGTH))
-      if (m !~ ENVIRON["PLACEHOLDER_RE"]) hit[file ": real-looking KEY/TOKEN/SECRET value"] = 1
+      v = m; sub(/^[^=:]*[=:]/, "", v)
+      # Real keys mix letters and digits; constants like TOKEN_TYPE = "a.b_c" do not.
+      if (v ~ /[0-9]/ && v ~ /[a-z]/ && m !~ ENVIRON["PLACEHOLDER_RE"])
+        hit[file ": real-looking KEY/TOKEN/SECRET value"] = 1
     }
   }
   END { for (h in hit) print h }

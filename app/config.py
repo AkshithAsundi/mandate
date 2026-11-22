@@ -28,5 +28,9 @@ def approval_secret() -> str:
     return os.getenv("APPROVAL_SECRET", "").strip()
 
 
+def mock_wallet_start_balance() -> float:
+    return float(os.getenv("MOCK_WALLET_BALANCE", "50000"))
+
+
 def base_url() -> str:
     return os.getenv("MANDATE_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
